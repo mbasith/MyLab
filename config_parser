@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""
+flatten_cmds_keys_py3.py
+
+Python 3 ONLY.
+
+Reads an indented config from "sample_config" and converts it into
+single-line commands. Any line that has children is treated as a
+"group", and the last token of that group line is wrapped in brackets
+to mark it as a key (e.g., dns-server-a -> [dns-server-a]).
+
+'!' lines end blocks and are ignored; indentation defines structure.
+"""
+
+from typing import List, Tuple, Dict, Optional
+from pathlib import Path
+import sys
+
+CONFIG_FILE = "sample_config"
+TABSIZE = 2  # number of spaces a tab expands to
+
+
+def _iter_entries(lines: List[str], tabsize: int = TABSIZE) -> List[Dict[str, object]]:
+    """
+    Produce structured entries:
+      - indent: int (spaces after expanding tabs)
+      - tokens: List[str] (content tokens)
+      - next_indent: Optional[int] (indent of next kept line)
+    Skips blank lines and lines that are exactly '!'.
+    """
+    buf: List[Dict[str, object]] = []
+    for raw in lines:
+        rs = raw.rstrip("\n")
+        if not rs.strip():
+            continue
+
+        expanded = rs.expandtabs(tabsize)
+        indent = len(expanded) - len(expanded.lstrip(" "))
+        content = expanded.strip()
+
+        if content == "!":
+            continue
+
+        tokens = content.split()
+        if not tokens:
+            continue
+
+        buf.append({"indent": indent, "tokens": tokens})
+
+    for i, ent in enumerate(buf):
+        ent["next_indent"] = buf[i + 1]["indent"] if i + 1 < len(buf) else None
+    return buf
+
+
+def _bracket_key(tokens: List[str]) -> List[str]:
+    """Return tokens with the last token wrapped in [brackets] (idempotent)."""
+    if not tokens:
+        return tokens
+    last = tokens[-1]
+    if last.startswith("[") and last.endswith("]"):
+        return tokens
+    return tokens[:-1] + [f"[{last}]"]
+
+
+def flatten_commands(text: str, tabsize: int = TABSIZE) -> List[str]:
+    """
+    Convert indented blocks to flat single-line commands with grouped structure.
+
+    Rules:
+      - A line is a "group segment" if the next kept line is more indented.
+      - Group segments contribute to the path, with their LAST token bracketed.
+      - A line is a "leaf" if the next kept line is not more indented.
+      - Consecutive leaves at the same indent under the same parent are bundled
+        together in one output line.
+      - '!' lines are ignored (indentation changes implicitly close groups).
+    """
+    entries = _iter_entries(text.splitlines(), tabsize=tabsize)
+    out: List[str] = []
+    stack: List[Tuple[int, List[str]]] = []  # (indent, tokens) for group segments
+
+    i = 0
+    n = len(entries)
+    while i < n:
+        ent = entries[i]
+        indent: int = ent["indent"]  # type: ignore[assignment]
+        tokens: List[str] = ent["tokens"]  # type: ignore[assignment]
+        next_indent: Optional[int] = ent["next_indent"]  # type: ignore[assignment]
+
+        # Close groups until we reach the parent with smaller indent
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+
+        # Determine if current line starts a group
+        is_group = (next_indent is not None and next_indent > indent)
+
+        if is_group:
+            # Push group; we'll bracket its "key" (last token) when emitting path
+            stack.append((indent, tokens))
+            i += 1
+            continue
+
+        # Bundle consecutive leaves at the same indent (under the same parent)
+        bundle: List[str] = []
+        j = i
+        while j < n:
+            e = entries[j]
+            if e["indent"] != indent:
+                break
+            e_next_indent = entries[j + 1]["indent"] if j + 1 < n else None
+            e_is_group = (e_next_indent is not None and e_next_indent > e["indent"])
+            if e_is_group:
+                break
+            bundle.extend(e["tokens"])
+            j += 1
+
+        # Emit: path (all groups with bracketed keys) + bundled leaf tokens
+        path: List[str] = []
+        for _, toks in stack:
+            path.extend(_bracket_key(toks))
+        line = " ".join(path + bundle)
+        if line.strip():
+            out.append(line)
+
+        i = j  # continue after bundled leaves
+
+    return out
+
+
+def main() -> None:
+    p = Path(CONFIG_FILE)
+    if not p.exists():
+        print(f'Error: "{CONFIG_FILE}" not found in the current directory.', file=sys.stderr)
+        sys.exit(1)
+
+    text = p.read_text(encoding="utf-8")
+    for line in flatten_commands(text, tabsize=TABSIZE):
+        print(line)
+
+
+if __name__ == "__main__":
+    main()
