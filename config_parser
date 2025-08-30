@@ -1,60 +1,49 @@
 #!/usr/bin/env python3
 """
-flatten_cmds_keys_root_rule_py3.py
+flatten_cmds_indentation_bang_keys_py3.py
 
 Python 3 ONLY.
 
-- Reads "sample_config".
-- Any line with children is a "group"; the last token of each group line is
-  bracketed (e.g., dns-server-a -> [dns-server-a]) when used in the path.
-- Lines with NO indentation (indent == 0):
-    * If they have children -> DO NOT print them alone; they only act as the root group.
-    * If they have no children -> Print them as their own single-line command.
-- '!' lines are ignored; indentation defines structure.
+Rules:
+- Dynamic indentation: any increase in indentation => child of the current top.
+- '!' marks the end of the most recent open item (command/subcommand).
+  When closing a LEAF (an item with no children), emit a single-line command
+  composed of the remaining groups' path + the leaf tokens.
+- Lines with no indentation (root):
+    * If they have children -> do NOT print them alone; they only act as root group.
+    * If they have no children -> print them as their own command.
+- Any line that has children is a "group" and its LAST token is bracketed
+  in emitted paths, e.g. dns-server-a -> [dns-server-a].
+
+Input is read from a file named "sample_config" in the current directory.
 """
 
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple
 from pathlib import Path
 import sys
 
 CONFIG_FILE = "sample_config"
-TABSIZE = 2  # number of spaces a tab expands to
 
+class Frame:
+    __slots__ = ("indent", "tokens", "had_children")
+    def __init__(self, indent: int, tokens: List[str]) -> None:
+        self.indent = indent
+        self.tokens = tokens
+        self.had_children = False  # becomes True once a child is pushed
 
-def _iter_entries(lines: List[str], tabsize: int = TABSIZE) -> List[Dict[str, object]]:
-    """
-    Produce structured entries:
-      - indent: int (spaces after expanding tabs)
-      - tokens: List[str] (content tokens)
-      - next_indent: Optional[int] (indent of next kept line)
-    Skips blank lines and lines that are exactly '!'.
-    """
-    buf: List[Dict[str, object]] = []
-    for raw in lines:
-        rs = raw.rstrip("\n")
-        if not rs.strip():
-            continue
+def _count_indent(line: str) -> int:
+    """Count leading spaces (tabs expanded to 4)."""
+    expanded = line.expandtabs(4)
+    return len(expanded) - len(expanded.lstrip(" "))
 
-        expanded = rs.expandtabs(tabsize)
-        indent = len(expanded) - len(expanded.lstrip(" "))
-        content = expanded.strip()
+def _is_bang(line: str) -> bool:
+    return line.strip() == "!"
 
-        if content == "!":
-            continue
-
-        tokens = content.split()
-        if not tokens:
-            continue
-
-        buf.append({"indent": indent, "tokens": tokens})
-
-    for i, ent in enumerate(buf):
-        ent["next_indent"] = buf[i + 1]["indent"] if i + 1 < len(buf) else None
-    return buf
-
+def _tokenize(line: str) -> List[str]:
+    return line.strip().split()
 
 def _bracket_key(tokens: List[str]) -> List[str]:
-    """Return tokens with the last token wrapped in [brackets] (idempotent)."""
+    """Bracket the last token (idempotent). For group frames only."""
     if not tokens:
         return tokens
     last = tokens[-1]
@@ -62,84 +51,82 @@ def _bracket_key(tokens: List[str]) -> List[str]:
         return tokens
     return tokens[:-1] + [f"[{last}]"]
 
+def _emit_path(stack: List[Frame], leaf_tokens: List[str], out: List[str]) -> None:
+    """Emit a single-line command: bracketed group path + leaf tokens."""
+    path: List[str] = []
+    for fr in stack:
+        # Only bracket frames that actually had children (i.e., groups)
+        if fr.had_children:
+            path.extend(_bracket_key(fr.tokens))
+        else:
+            path.extend(fr.tokens)
+    line = " ".join(path + leaf_tokens).strip()
+    if line:
+        out.append(line)
 
-def flatten_commands(text: str, tabsize: int = TABSIZE) -> List[str]:
+def flatten_commands(text: str) -> List[str]:
     """
-    Convert indented blocks to flat single-line commands per rules above.
+    Streaming parse:
+    - Push every non-'!' line as a frame.
+    - On indent increase, mark parent.had_children = True.
+    - On same or lower indent, close frames; emit if a closed frame had no children.
+    - On '!' line, close one frame; emit if closed frame had no children.
+    - After all lines, close remaining frames (emit leaves only).
     """
-    entries = _iter_entries(text.splitlines(), tabsize=tabsize)
     out: List[str] = []
-    stack: List[Tuple[int, List[str]]] = []  # (indent, tokens) for group segments
+    stack: List[Frame] = []
 
-    i = 0
-    n = len(entries)
-    while i < n:
-        ent = entries[i]
-        indent: int = ent["indent"]  # type: ignore[assignment]
-        tokens: List[str] = ent["tokens"]  # type: ignore[assignment]
-        next_indent: Optional[int] = ent["next_indent"]  # type: ignore[assignment]
+    lines = [ln.rstrip("\n") for ln in text.splitlines()]
+    for raw in lines:
+        if not raw.strip():
+            continue  # skip blanks
 
-        # Root-level handling: print only if it has no children; otherwise just set as root group.
-        if indent == 0:
-            stack.clear()
-            is_group_root = (next_indent is not None and next_indent > indent)
-            if is_group_root:
-                # Do NOT print; just push as the root group for descendants.
-                stack.append((indent, tokens))
-            else:
-                # Leaf at root level -> print as its own command.
-                out.append(" ".join(tokens))
-            i += 1
+        if _is_bang(raw):
+            # Explicit close: pop one frame; emit if it was a leaf
+            if stack:
+                closed = stack.pop()
+                if not closed.had_children:
+                    _emit_path(stack, closed.tokens, out)
             continue
 
-        # For non-root lines, close groups until we reach the correct parent
-        while stack and stack[-1][0] >= indent:
-            stack.pop()
-
-        is_group = (next_indent is not None and next_indent > indent)
-        if is_group:
-            # Push and continue; emission happens when we hit leaves under this group.
-            stack.append((indent, tokens))
-            i += 1
+        indent = _count_indent(raw)
+        tokens = _tokenize(raw)
+        if not tokens:
             continue
 
-        # Leaf: bundle consecutive leaves at the same indent (non-root only)
-        bundle: List[str] = []
-        j = i
-        while j < n:
-            e = entries[j]
-            if e["indent"] != indent:
-                break
-            e_next_indent = entries[j + 1]["indent"] if j + 1 < n else None
-            e_is_group = (e_next_indent is not None and e_next_indent > e["indent"])
-            if e_is_group:
-                break
-            bundle.extend(e["tokens"])
-            j += 1
+        # Implicit closes on same/lower indent
+        while stack and indent <= stack[-1].indent:
+            closed = stack.pop()
+            if not closed.had_children:
+                # Emit leaf on implicit close
+                _emit_path(stack, closed.tokens, out)
 
-        # Emit: path (groups with bracketed keys) + bundled leaf tokens
-        path: List[str] = []
-        for _, toks in stack:
-            path.extend(_bracket_key(toks))
-        line = " ".join(path + bundle)
-        if line.strip():
-            out.append(line)
+        # If there is a parent now, mark it as having children
+        if stack and indent > stack[-1].indent:
+            stack[-1].had_children = True
 
-        i = j  # continue after bundled leaves
+        # Push the new frame
+        stack.append(Frame(indent, tokens))
+
+    # End of file: close remaining frames, emitting only leaves
+    while stack:
+        closed = stack.pop()
+        if not closed.had_children:
+            _emit_path(stack, closed.tokens, out)
+
+    # Root rule: ensure that a root (indent==0) was only printed alone if it had no children.
+    # The above logic already enforces this (groups never emit on close).
 
     return out
-
 
 def main() -> None:
     p = Path(CONFIG_FILE)
     if not p.exists():
         print(f'Error: "{CONFIG_FILE}" not found in the current directory.', file=sys.stderr)
         sys.exit(1)
-
     text = p.read_text(encoding="utf-8")
-    for line in flatten_commands(text, tabsize=TABSIZE):
+    for line in flatten_commands(text):
         print(line)
-
 
 if __name__ == "__main__":
     main()
