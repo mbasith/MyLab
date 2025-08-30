@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-flatten_cmds_keys_rootown_py3.py
+flatten_cmds_keys_root_rule_py3.py
 
 Python 3 ONLY.
 
 - Reads "sample_config".
 - Any line with children is a "group"; the last token of each group line is
   bracketed (e.g., dns-server-a -> [dns-server-a]) when used in the path.
-- Any line with NO indentation (indent == 0) is treated as its own command
-  and printed immediately. If it also has children, it is printed AND
-  becomes the root group for subsequent descendants.
+- Lines with NO indentation (indent == 0):
+    * If they have children -> DO NOT print them alone; they only act as the root group.
+    * If they have no children -> Print them as their own single-line command.
 - '!' lines are ignored; indentation defines structure.
 """
 
@@ -65,16 +65,7 @@ def _bracket_key(tokens: List[str]) -> List[str]:
 
 def flatten_commands(text: str, tabsize: int = TABSIZE) -> List[str]:
     """
-    Convert indented blocks to flat single-line commands.
-
-    Rules:
-      - Group segments (a line whose next kept line is more indented) contribute
-        to the path; their LAST token is bracketed.
-      - Leaf lines (no more-indented next line) are bundled with sibling leaves
-        at the same indent under the same parent (except at indent==0; see below).
-      - Lines with indent == 0 are ALWAYS printed as their own command immediately.
-        If such a line is a group, it is also pushed to the stack for descendants.
-      - '!' lines are ignored.
+    Convert indented blocks to flat single-line commands per rules above.
     """
     entries = _iter_entries(text.splitlines(), tabsize=tabsize)
     out: List[str] = []
@@ -88,37 +79,31 @@ def flatten_commands(text: str, tabsize: int = TABSIZE) -> List[str]:
         tokens: List[str] = ent["tokens"]  # type: ignore[assignment]
         next_indent: Optional[int] = ent["next_indent"]  # type: ignore[assignment]
 
-        # If we encounter a root-level line, treat it as its own command.
+        # Root-level handling: print only if it has no children; otherwise just set as root group.
         if indent == 0:
-            # Close any previous context
             stack.clear()
             is_group_root = (next_indent is not None and next_indent > indent)
-
-            # For the standalone command: bracket if it's a group line to keep
-            # key semantics consistent (optional; can remove if undesired).
-            standalone_tokens = _bracket_key(tokens) if is_group_root else tokens
-            out.append(" ".join(standalone_tokens))
-
             if is_group_root:
-                # Now use it as the root for following descendants
+                # Do NOT print; just push as the root group for descendants.
                 stack.append((indent, tokens))
-
+            else:
+                # Leaf at root level -> print as its own command.
+                out.append(" ".join(tokens))
             i += 1
             continue
 
-        # For non-root lines, close groups until we reach the right parent
+        # For non-root lines, close groups until we reach the correct parent
         while stack and stack[-1][0] >= indent:
             stack.pop()
 
         is_group = (next_indent is not None and next_indent > indent)
-
         if is_group:
-            # Just push; emission happens when we hit leaves below this group
+            # Push and continue; emission happens when we hit leaves under this group.
             stack.append((indent, tokens))
             i += 1
             continue
 
-        # Leaf: bundle consecutive leaves at the same indent (NOT root level)
+        # Leaf: bundle consecutive leaves at the same indent (non-root only)
         bundle: List[str] = []
         j = i
         while j < n:
